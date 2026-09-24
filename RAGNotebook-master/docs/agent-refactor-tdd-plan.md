@@ -20,19 +20,23 @@
 | **P4** 溯源链路打通 | ✅ 完成 | sources 事件 + 持久化 + 前端来源卡片 + 历史回放 |
 | **P5** 沉淀闭环 | ✅ 完成 | suggestion 事件 + 一键存为笔记 |
 | **P6** 评测 | ⏳ 未做 | 评测脚本按用户要求**不重建**；语料生成见 `eval-corpus-generation.md` |
-| **收尾** 前端构建修复 | ✅ 完成 | `NoteList.tsx` 4 处既有类型错误（阻断 `npm run build`） |
+| **收尾** 前端构建 + 风格清理 | ✅ 完成 | `NoteList.tsx` 4 处既有类型错误；`ruff check app/ tests/` 从 8 处既有问题 → 全绿 |
 
 测试：`72 passed`。每个阶段均先红后绿。
-构建：`npm run build` 通过（1.93s）；`tsc -b` 零错误。
+构建：`npm run build` 通过（1.93s）；`tsc -b` 零错误；`ruff check` 全绿。
 
-### 收尾　前端构建修复（✅ 已完成）
+### 收尾　前端构建修复 + 风格清理（✅ 已完成）
 
-`NoteList.tsx` 有 4 处**既有**类型错误，导致 `npm run build` 失败（与 Agent 化改造无关）：
+**前端**：`NoteList.tsx` 有 4 处**既有**类型错误，导致 `npm run build` 失败（与 Agent 化改造无关）：
 
 - 第 55 行 `allValues` 声明后未使用 → 删除
 - 第 82 行 `useRef<ReturnType<typeof setTimeout>>()` 缺少初始值（React 19 起类型要求必填）
   → 改为 `useRef<ReturnType<typeof setTimeout> | undefined>(undefined)`
 - 第 197 / 207 行向该 ref 赋 `undefined`，随上面类型放宽而消解
+
+**后端风格**：`ruff check app/ tests/` 原有 8 处既有问题（缺文件尾换行、import 未排序、
+未使用 import、模板字面量超长行），全部清理，现已 `All checks passed!`。
+其中 `note_template_service.py:59` 的超长行用**隐式字符串拼接**换行，已用 AST 校验拼接后值不变（长度 130）。
 
 ### P5　沉淀闭环（✅ 已完成）
 

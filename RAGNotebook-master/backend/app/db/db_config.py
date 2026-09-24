@@ -103,9 +103,10 @@ async def get_db():
 
 
 async def seed_test_user():
+    from sqlalchemy import select
+
     from app.models.user_model import User, UserStatusChoice
     from app.utils.auth_utils import hash_password
-    from sqlalchemy import select
 
     async with AsyncSessionLocal() as session:
         result = await session.execute(select(User).where(User.username == "admin"))
