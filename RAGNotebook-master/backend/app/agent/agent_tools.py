@@ -1,5 +1,4 @@
 import datetime
-from collections.abc import Callable
 from contextvars import ContextVar
 
 from langchain_core.tools import tool
@@ -7,11 +6,15 @@ from langchain_core.tools import tool
 from app.core.background_init import init_manager
 from app.core.logger_handler import logger
 from app.db.db_config import AsyncSessionLocal
+from app.rag.knowledge_search import (
+    format_for_model,
+    get_document_detail,
+    parse_source_id,
+    search_unified,
+)
 from app.services.review_service import review_service
-from app.utils.auth_utils import decode_django_jwt
 
 current_user_id_var: ContextVar[str] = ContextVar('current_user_id', default=None)
-thinking_callback_var: ContextVar[Callable | None] = ContextVar('thinking_callback', default=None)
 
 def set_current_user_id(user_id: str):
     """设置当前用户ID到上下文"""
@@ -21,53 +24,65 @@ def get_current_user_id_from_context() -> str:
     """从上下文获取当前用户ID"""
     return current_user_id_var.get()
 
-def set_thinking_callback(callback):
-    """设置思考过程回调到上下文"""
-    thinking_callback_var.set(callback)
-
-def get_thinking_callback_from_context():
-    """从上下文获取思考过程回调"""
-    return thinking_callback_var.get()
-
-@tool(description="当用户明确问自己的ID和用户名时，从JWT中获取当前用户ID和用户名，参数为完整的JWT token字符串")
-async def get_user_info_tools(token: str) -> str:
-    """获取用户信息工具"""
-    payload = decode_django_jwt(token)
-    if payload:
-        user_id = payload.get("user_id", "未知")
-        user_name = payload.get("user_name", "未知")
-        return f"用户信息：\n- 用户ID: {user_id}\n- 用户名: {user_name}"
-    else:
-        return "无法解析JWT token，无法获取用户信息"
-
 @tool(description="用于获取当前年月日时分的工具")
 async def what_time_is_now() -> str:
     """获取当前年月日时分的工具"""
     return f"当前时间是：{datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}"
 
-@tool(description="语义搜索用户的笔记，根据关键词返回最相关的笔记列表。参数 query 为搜索关键词，top_k 为返回结果数量（默认5）。")
-async def search_notes_tool(query: str, top_k: int = 5) -> str:
-    """搜索笔记工具"""
+@tool(description=(
+    "在用户的「全部知识」中做语义检索，同时覆盖笔记与知识库文档，返回最相关的资料片段。"
+    "当用户的问题需要依据其个人资料回答时使用（如「我之前记过什么」「帮我查一下」）。"
+    "参数 query 为检索词，建议用关键词而非整句话；top_k 为返回条数（默认5）。"
+    "返回结果带 [1][2] 编号，回答时请在关键结论后标注对应编号。"
+))
+async def search_knowledge_tool(query: str, top_k: int = 5) -> str:
+    """
+    统一知识检索工具：同时检索笔记与知识库
+
+    检索无果时返回明确提示，让模型知道该换关键词重试或如实告知，
+    而不是拿到空串后自由发挥。
+    """
     user_id = get_current_user_id_from_context()
     if not user_id:
         return "错误: 无法确定用户身份"
-    async with AsyncSessionLocal() as db:
-        try:
-            results = await init_manager.note_service.search_notes(db, user_id, query, top_k=top_k)
-            if not results:
-                return "未找到相关笔记"
-            lines = [f"找到 {len(results)} 篇相关笔记：\n"]
-            for i, note in enumerate(results, 1):
-                lines.append(f"{i}. **{note.title}**")
-                if note.category:
-                    lines.append(f"   分类: {note.category}")
-                if note.tags:
-                    lines.append(f"   标签: {', '.join(note.tags)}")
-                lines.append(f"   内容预览: {note.content[:200]}...\n")
-            return "\n".join(lines)
-        except Exception as e:
-            logger.error(f"搜索笔记失败: {e}")
-            return f"搜索笔记时出错: {str(e)}"
+
+    try:
+        items = await search_unified(user_id, query, top_k)
+    except Exception as e:
+        logger.error(f"统一知识检索失败: {e}")
+        return f"检索时出错: {str(e)}"
+
+    if not items:
+        return "未找到相关内容"
+
+    # 返回文本内嵌 source_id，供调用方解析回结构化来源（ContextVar 跨不过 LangGraph 子任务边界）
+    return format_for_model(items)
+
+
+@tool(description=(
+    "根据 source_id 取回某条资料的完整内容。"
+    "当检索到的片段信息不足、需要看全文上下文时使用（如片段被截断、结论缺少依据）。"
+    "参数 source_id 取自检索结果中标注的 source_id 值，形如 note:xxx 或 kb:xxx。"
+))
+async def get_document_detail_tool(source_id: str) -> str:
+    """
+    二级检索工具：按 source_id 取资料全文
+
+    与 search_knowledge_tool 构成两级检索——一级便宜覆盖广，二级按需取全文。
+    """
+    user_id = get_current_user_id_from_context()
+    if not user_id:
+        return "错误: 无法确定用户身份"
+
+    if parse_source_id(source_id) is None:
+        return f"无效的 source_id: {source_id}"
+
+    content = await get_document_detail(source_id, user_id)
+    if not content:
+        return "未找到该资料，可能已被删除"
+
+    return content
+
 
 @tool(description="获取用户的笔记统计信息，包括笔记总数、各分类（工作/学习/生活/项目）的笔记数量。")
 async def get_note_stats_tool() -> str:

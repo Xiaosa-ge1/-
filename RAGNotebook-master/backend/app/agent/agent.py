@@ -3,24 +3,22 @@ import json
 import os
 from collections.abc import AsyncGenerator
 
-from langchain_classic.agents import AgentExecutor, create_tool_calling_agent
+from langchain.agents import create_agent as create_langgraph_agent
 from langchain_community.chat_models import ChatTongyi
-from langchain_core.messages import BaseMessage
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.tools import BaseTool
 from langchain_ollama import ChatOllama
 
 from app.agent.agent_middleware import get_middleware
 from app.agent.agent_tools import (
     create_note_tool,
+    get_document_detail_tool,
     get_note_stats_tool,
     get_related_notes_tool,
     get_today_reviews_tool,
-    get_user_info_tools,
     mark_reviewed_tool,
-    search_notes_tool,
+    search_knowledge_tool,
     set_current_user_id,
-    set_thinking_callback,
     what_time_is_now,
 )
 from app.core.logger_handler import logger
@@ -105,8 +103,10 @@ class AgentFactory:
         """获取默认工具列表"""
         return [
             what_time_is_now,
-            get_user_info_tools,
-            search_notes_tool,
+            # 统一检索：同时覆盖笔记与知识库，取代原先仅搜笔记的 search_notes_tool
+            search_knowledge_tool,
+            # 两级检索的第二级：片段不够时按 source_id 取全文
+            get_document_detail_tool,
             get_note_stats_tool,
             get_today_reviews_tool,
             mark_reviewed_tool,
@@ -158,57 +158,35 @@ class AgentFactory:
         else:
             raise ValueError(f"不支持的LLM_TYPE: {llm_type}，可选值: ALIYUN, OLLAMA")
 
-    def _create_prompt(self, custom_system_prompt: str | None = None) -> ChatPromptTemplate:
-        """内部方法：创建提示词模板"""
-        return ChatPromptTemplate.from_messages([
-            ("system", "{system_prompt}"),
-            MessagesPlaceholder(variable_name="chat_history"),
-            ("human", "{input}"),
-            MessagesPlaceholder(variable_name="agent_scratchpad")
-        ])
-
-    def create_agent_executor(
+    def create_agent(
             self,
             custom_tools: list[BaseTool] | None = None,
             custom_model: str | None = None,
             custom_system_prompt: str | None = None,
-            verbose: bool = True,
-            return_intermediate_steps: bool = True,
-            **kwargs
-    ) -> AgentExecutor:
+            custom_middleware: list | None = None,
+    ):
         """
-        核心工厂方法：创建全新的 AgentExecutor 实例
-        每次调用都会生成新的实例，彻底避免全局状态污染
+        核心工厂方法：创建全新的 LangGraph Agent 实例
+
+        相比 AgentExecutor，LangGraph 的 create_agent 会真正消费 middleware，
+        日志、工具调用追踪等钩子才会生效（此前挂在 AgentExecutor 上属于死代码）。
 
         :param custom_tools: 自定义工具列表（覆盖默认）
         :param custom_model: 自定义模型（覆盖默认）
         :param custom_system_prompt: 自定义系统提示词（覆盖默认）
-        :param verbose: 是否打印详细日志
-        :param return_intermediate_steps: 是否返回中间步骤
-        :param kwargs: 其他 AgentExecutor 参数
-        :return: 全新的 AgentExecutor 实例
+        :param custom_middleware: 自定义中间件列表（覆盖默认）
+        :return: 编译后的 LangGraph 图
         """
-        # 1. 创建组件（每次都重新创建，避免全局状态污染）
         chat_model = self._create_chat_model(custom_model)
-        prompt = self._create_prompt()
         tools = custom_tools or self.default_tools
+        middleware = custom_middleware if custom_middleware is not None else self.default_middleware
+        system_prompt = custom_system_prompt or self.default_system_prompt
 
-        # 2. 创建 Agent
-        agent = create_tool_calling_agent(chat_model, tools, prompt)
-
-        # 3. 创建 Executor
-        # stream_runnable=False: 禁用 agent planning 阶段的流式调用，
-        # 避免 Qwen3 流式 tool_call_chunks 的 arguments 增量片段无法正确聚合。
-        # LLM 的 token 级流式输出仍通过 executor 的 astream 正常工作。
-        return AgentExecutor(
-            agent=agent,
+        return create_langgraph_agent(
+            chat_model,
             tools=tools,
-            verbose=verbose,
-            return_intermediate_steps=return_intermediate_steps,
-            handle_parsing_errors=True,
-            max_iterations=5,
-            stream_runnable=False,
-            **kwargs
+            system_prompt=system_prompt,
+            middleware=middleware,
         )
 
 
@@ -216,12 +194,72 @@ class AgentFactory:
 agent_factory = AgentFactory()
 
 
-def get_agent_executor():
+def build_messages(history: list[tuple] | None, query: str) -> list[BaseMessage]:
     """
-    获取AgentExecutor实例，用于LangGraph
-    :return: AgentExecutor实例
+    构造 LangGraph 输入消息序列
+
+    :param history: 会话历史 [(user_msg, assistant_msg), ...]
+    :param query: 本次用户输入
+    :return: 消息列表
     """
-    return agent_factory.create_agent_executor()
+    messages: list[BaseMessage] = []
+    if history:
+        for user_msg, assistant_msg in history:
+            messages.append(HumanMessage(content=user_msg))
+            messages.append(AIMessage(content=assistant_msg))
+    messages.append(HumanMessage(content=query))
+    return messages
+
+
+def extract_final_text(result: dict) -> str:
+    """
+    从 LangGraph 返回结果中取出最终回答
+
+    末尾可能带 tool_calls 的消息是中间步骤，必须跳过，
+    取最后一条没有工具调用的 AI 消息才是真正回答。
+
+    :param result: agent.ainvoke 的返回值
+    :return: 最终回答文本
+    """
+    messages = result.get("messages", []) if isinstance(result, dict) else []
+    for message in reversed(messages):
+        if not isinstance(message, AIMessage):
+            continue
+        if getattr(message, "tool_calls", None):
+            continue
+        content = message.content
+        if isinstance(content, str) and content:
+            return content
+        # 多模态返回时 content 是分块列表，拼接文本部分
+        if isinstance(content, list):
+            texts = [part.get("text", "") for part in content if isinstance(part, dict)]
+            joined = "".join(texts)
+            if joined:
+                return joined
+    return "抱歉，我无法理解您的请求。"
+
+
+def extract_tool_steps(messages: list[BaseMessage]) -> list[dict]:
+    """
+    从消息序列中提取工具调用步骤，用于前端展示思考过程
+
+    :param messages: LangGraph 完整消息序列
+    :return: [{thought, tool, tool_input, tool_output}, ...]
+    """
+    steps: list[dict] = []
+    for message in messages:
+        tool_calls = getattr(message, "tool_calls", None)
+        if tool_calls:
+            for call in tool_calls:
+                steps.append({
+                    "thought": "",
+                    "tool": call.get("name"),
+                    "tool_input": call.get("args"),
+                    "tool_output": "",
+                })
+        if isinstance(message, ToolMessage) and steps and not steps[-1]["tool_output"]:
+            steps[-1]["tool_output"] = message.content
+    return steps
 
 
 async def get_agent_response(
@@ -244,44 +282,23 @@ async def get_agent_response(
         set_current_user_id(user_id)
 
     try:
-        # 1. 从工厂获取全新的 Executor 实例
-        agent_executor = agent_factory.create_agent_executor(custom_tools=custom_tools, **kwargs)
+        # 1. 从工厂获取全新的 LangGraph Agent
+        agent = agent_factory.create_agent(custom_tools=custom_tools, **kwargs)
 
-        # 2. 构建聊天历史
-        chat_history: list[BaseMessage] = []
-        if history:
-            from langchain_core.messages import AIMessage, HumanMessage
-            for user_msg, assistant_msg in history:
-                chat_history.append(HumanMessage(content=user_msg))
-                chat_history.append(AIMessage(content=assistant_msg))
+        # 2. 构建消息序列并执行
+        messages = build_messages(history, query)
+        result = await agent.ainvoke({"messages": messages})
 
-        # 3. 流式执行
-        full_response = []
-        steps = []
-        async for chunk in agent_executor.astream({
-            "input": query,
-            "chat_history": chat_history,
-            "system_prompt": agent_factory.default_system_prompt
-        }):
-            if "output" in chunk:
-                full_response.append(chunk["output"])
-            elif "intermediate_steps" in chunk:
-                for action, observation in chunk["intermediate_steps"]:
-                    # 记录日志
-                    logger.info(f"\n\n🧠 [Agent 思考] {action.log}")
-                    logger.info(f"🛠️ [调用工具] {action.tool}")
-                    logger.info(f"📥 [工具输入] {action.tool_input}")
-                    logger.info(f"📤 [工具结果] {observation}\n")
-                    # 收集步骤
-                    steps.append({
-                        "thought": action.log,
-                        "tool": action.tool,
-                        "tool_input": action.tool_input,
-                        "tool_output": observation
-                    })
+        # 3. 提取回答与工具调用步骤
+        all_messages = result.get("messages", []) if isinstance(result, dict) else []
+        steps = extract_tool_steps(all_messages)
+        for step in steps:
+            logger.info(f"🛠️ [调用工具] {step['tool']}")
+            logger.info(f"📥 [工具输入] {step['tool_input']}")
+            logger.info(f"📤 [工具结果] {step['tool_output']}")
 
         return {
-            "response": "".join(full_response) if full_response else "抱歉，我无法理解您的请求。",
+            "response": extract_final_text(result),
             "steps": steps
         }
 
@@ -297,16 +314,18 @@ async def get_agent_stream_response(
         session_id: str,
         user_id: str,
         custom_tools: list[BaseTool] | None = None,
-        rag_context: str = "",
         **kwargs
 ) -> AsyncGenerator[str, None]:
     """
-    获取 Agent 流式响应（包含思考过程，实时推送）
+    获取 Agent 流式响应（真流式，模型产出 token 即推送）
+
+    不再接收路由层预检索的上下文：检索已下沉为 Agent 自己的工具，
+    由模型决定何时查、查什么、要不要取全文。
+
     :param query: 用户查询
     :param session_id: 会话 ID
     :param user_id: 用户 ID
     :param custom_tools: 自定义工具（可选）
-    :param rag_context: 预检索的 RAG 上下文（由路由层注入，为空则跳过）
     :param kwargs: 其他参数
     :return: 流式响应生成器
     """
@@ -315,55 +334,36 @@ async def get_agent_stream_response(
     agent_result_holder = {"response": None, "error": None}
     agent_done = asyncio.Event()
 
-    async def thinking_callback(data: dict):
-        """思考过程回调函数，将事件放入队列"""
-        logger.info(f"【思考过程】{data.get('stage', 'unknown')}: {data.get('content', '')}")
-        await thinking_queue.put(data)
-
     async def run_agent():
-        """在独立任务中执行 Agent"""
+        """在独立任务中执行 Agent，模型产出 token 即入队，实现真流式"""
         try:
             set_current_user_id(user_id)
-            set_thinking_callback(thinking_callback)
 
             history = await sm.session_manager.get_history(session_id, user_id)
             logger.info(f"【Agent流式响应】获取会话历史成功，历史记录数: {len(history)}")
 
-            chat_history: list[BaseMessage] = []
-            if history:
-                from langchain_core.messages import AIMessage, HumanMessage
-                for user_msg, assistant_msg in history:
-                    chat_history.append(HumanMessage(content=user_msg))
-                    chat_history.append(AIMessage(content=assistant_msg))
+            messages = build_messages(history, query)
 
-            agent_executor = agent_factory.create_agent_executor(custom_tools=custom_tools, **kwargs)
-
-            # 根据是否有 RAG 上下文决定 system prompt 内容
-            if rag_context:
-                system_prompt = f"""你是用户的智能助手。
-
-以下是与用户问题相关的参考资料：
-{rag_context}
-
-请基于以上资料回答用户的问题。如果资料中没有相关信息，请如实告知。"""
-            else:
-                system_prompt = agent_factory.default_system_prompt
+            agent = agent_factory.create_agent(custom_tools=custom_tools, **kwargs)
 
             full_response = []
 
-            async for chunk in agent_executor.astream({
-                "input": query,
-                "chat_history": chat_history,
-                "system_prompt": system_prompt
-            }):
-                if "output" in chunk:
-                    full_response.append(chunk["output"])
-                elif "intermediate_steps" in chunk:
-                    for action, observation in chunk["intermediate_steps"]:
-                        logger.info(f"\n\n🧠 [Agent 思考] {action.log}")
-                        logger.info(f"🛠️ [调用工具] {action.tool}")
-                        logger.info(f"📥 [工具输入] {action.tool_input}")
-                        logger.info(f"📤 [工具结果] {observation}\n")
+            async for message_chunk, metadata in agent.astream(
+                {"messages": messages}, stream_mode="messages"
+            ):
+                # 只取「模型节点」产出的文本；工具节点的内容是调用参数，不能当回答
+                if metadata.get("langgraph_node") != "model":
+                    continue
+                # 带工具调用的分片属于中间步骤，跳过
+                if getattr(message_chunk, "tool_call_chunks", None):
+                    continue
+                content = getattr(message_chunk, "content", "")
+                if not content or not isinstance(content, str):
+                    continue
+                full_response.append(content)
+                await thinking_queue.put(
+                    {"type": "response", "content": content, "session_id": session_id}
+                )
 
             agent_result_holder["response"] = "".join(full_response) if full_response else "抱歉，我无法理解您的请求。"
         except Exception as e:
@@ -416,14 +416,7 @@ async def get_agent_stream_response(
         await sm.session_manager.add_message(session_id, user_id, query, response)
         logger.info("【Agent流式响应】添加到会话历史成功")
 
-        # 发送回答内容（按chunk发送，减少SSE事件数）
-        chunk_size = 15
-        for i in range(0, len(response), chunk_size):
-            chunk = response[i:i + chunk_size]
-            yield f"data: {json.dumps({'type': 'response', 'content': chunk}, ensure_ascii=False)}\n\n"
-            await asyncio.sleep(0.03)
-
-        # 发送结束标记
+        # 正文已在生成过程中实时推送，这里只发结束标记
         yield f"data: {json.dumps({'type': 'done', 'session_id': session_id}, ensure_ascii=False)}\n\n"
         logger.info(f"【Agent流式响应】处理完成，会话ID: {session_id}")
 
