@@ -35,16 +35,19 @@ class DatabaseSessionManager:
                 messages = await db.run_sync(
                     lambda session: session.query(ChatMessage).filter(ChatMessage.session_id == result.id).order_by(ChatMessage.created_at).all()
                 )
-                # 转换为 (user_message, assistant_message) 格式
+                # 转换为 (user_message, assistant_message) 格式，并带上助手回复引用的来源
                 history = []
+                assistant_sources = []
                 i = 0
                 while i < len(messages):
                     if messages[i].role == "user" and i + 1 < len(messages) and messages[i+1].role == "assistant":
                         history.append((messages[i].content, messages[i+1].content))
+                        metadata = messages[i+1].metadata_ or {}
+                        assistant_sources.append(metadata.get("sources"))
                         i += 2
                     else:
                         i += 1
-                return {"history": history}
+                return {"history": history, "assistant_sources": assistant_sources}
             else:
                 # 检查会话id是否存在
                 existing_session = await db.run_sync(
@@ -70,10 +73,22 @@ class DatabaseSessionManager:
                     await db.commit()
                     await db.refresh(new_session)
                     logger.info(f"【数据库会话管理】创建新会话: {session_id} 属于用户: {user_id}")
-                    return {"history": []}
+                    return {"history": [], "assistant_sources": []}
 
-    async def add_message(self, session_id: str, user_id: str, user_message: str, assistant_message: str):
-        """添加消息并保存到数据库"""
+    async def add_message(
+        self,
+        session_id: str,
+        user_id: str,
+        user_message: str,
+        assistant_message: str,
+        sources: list | None = None,
+    ):
+        """
+        添加消息并保存到数据库
+
+        :param sources: 本次回答参考到的结构化来源，写入助手消息的 metadata，
+                        供刷新页面后仍能展示来源卡片
+        """
         async with AsyncSessionLocal() as db:
             # 检查会话id是否存在
             existing_session = await db.run_sync(
@@ -118,11 +133,12 @@ class DatabaseSessionManager:
             )
             db.add(user_msg)
 
-            # 添加助手消息
+            # 添加助手消息（来源存 metadata_，复用已有 JSON 字段，无需改表）
             assistant_msg = ChatMessage(
                 session_id=session.id,
                 role="assistant",
-                content=assistant_message
+                content=assistant_message,
+                metadata_={"sources": sources} if sources else None,
             )
             db.add(assistant_msg)
 

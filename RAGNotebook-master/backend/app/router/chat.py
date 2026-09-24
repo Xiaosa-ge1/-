@@ -54,8 +54,12 @@ async def query_rag(
 @chat_router.get("/session/{session_id}", response_model=SessionResponse)
 async def get_session(session_id: str, user_id: str = Depends(get_current_user_id), router_service: ChatService = Depends(get_router_service)):
     """获取会话信息，使用user_id验证"""
-    history = await router_service.handle_get_session(session_id, user_id)
-    return success_response(data=SessionResponse(session_id=session_id, history=history))
+    session_data = await router_service.handle_get_session(session_id, user_id)
+    return success_response(data=SessionResponse(
+        session_id=session_id,
+        history=session_data.get("history", []),
+        assistant_sources=session_data.get("assistant_sources", []),
+    ))
 
 
 @chat_router.delete("/session/{session_id}")

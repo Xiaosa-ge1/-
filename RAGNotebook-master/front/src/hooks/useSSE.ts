@@ -1,9 +1,11 @@
 import { useRef, useState, useCallback } from 'react'
-import type { SSEMessage, KnowledgeSSEMessage } from '../types/api'
+import type { SSEMessage, KnowledgeSSEMessage, SourceItem, SuggestionData } from '../types/api'
 
 type SSECallback = {
   onThinking?: (stage: string, content?: string, details?: Record<string, unknown>) => void
   onResponse?: (content: string, sessionId?: string) => void
+  onSources?: (items: SourceItem[], sessionId?: string) => void
+  onSuggestion?: (data: SuggestionData, sessionId?: string) => void
   onDone?: (sessionId?: string) => void
   onError?: (error: string) => void
   onKnowledgeProgress?: (data: KnowledgeSSEMessage) => void
@@ -99,6 +101,24 @@ export function useSSE() {
                     if (responseBuffer.length >= RESPONSE_FLUSH_THRESHOLD) {
                       flushResponse()
                     }
+                    break
+                  case 'sources':
+                    // 先把已缓冲的正文吐出去，保证「正文 -> 来源」的展示顺序
+                    flushResponse()
+                    if (msg.session_id) lastSessionId = msg.session_id
+                    callbacks.onSources?.(msg.items || [], msg.session_id)
+                    break
+                  case 'suggestion':
+                    flushResponse()
+                    if (msg.session_id) lastSessionId = msg.session_id
+                    callbacks.onSuggestion?.(
+                      {
+                        action: msg.action || '',
+                        title: msg.title || '',
+                        content_preview: msg.content_preview || '',
+                      },
+                      msg.session_id,
+                    )
                     break
                   case 'done':
                     flushResponse()

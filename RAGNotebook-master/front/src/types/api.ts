@@ -155,12 +155,29 @@ export interface ReviewListData {
   total_count: number
 }
 
+export interface SourceItem {
+  index: number
+  source_id: string
+  source_type: 'note' | 'knowledge_base'
+  title: string
+}
+
+export interface SuggestionData {
+  action: string
+  title: string
+  content_preview: string
+}
+
 export interface SSEMessage {
-  type: 'thinking' | 'response' | 'done' | 'error'
+  type: 'thinking' | 'response' | 'done' | 'error' | 'sources' | 'suggestion'
   content?: string
   session_id?: string
   stage?: string
   details?: Record<string, unknown>
+  items?: SourceItem[]
+  action?: string
+  title?: string
+  content_preview?: string
 }
 
 export interface KnowledgeSSEMessage {

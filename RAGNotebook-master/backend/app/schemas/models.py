@@ -17,6 +17,8 @@ class SessionResponse(BaseModel):
     """会话响应模型"""
     session_id: str
     history: list[tuple[str, str]]
+    # 与 history 中的助手回复一一对应，null 表示该轮没有检索到资料
+    assistant_sources: list[list[dict] | None] = []
 
 
 class AgentStep(BaseModel):

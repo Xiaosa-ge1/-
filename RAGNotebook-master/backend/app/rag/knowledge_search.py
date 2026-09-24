@@ -12,6 +12,8 @@
 import asyncio
 import re
 
+from langchain_core.messages import ToolMessage
+
 from app.core.logger_handler import logger
 from app.rag.source_formatter import build_source_item, merge_sources
 
@@ -20,12 +22,119 @@ SOURCE_TYPE_LABELS = {
     "knowledge_base": "知识库",
 }
 
+# 沉淀建议的触发门槛：回答太短通常是寒暄或简单问答，不值得存成笔记
+SUGGESTION_MIN_RESPONSE_LENGTH = 120
+SUGGESTION_TITLE_MAX_LENGTH = 40
+SUGGESTION_PREVIEW_MAX_LENGTH = 200
+
 # 解析工具返回文本中的来源行。
 # 标题用贪婪匹配 + 尾部 (source_id: ...) 锚定，才能兼容标题里含《》的情况。
 SOURCE_LINE_PATTERN = re.compile(
     r"^\[(\d+)\]\s+(?:笔记|知识库|资料)《(.+)》\s*\(source_id:\s*([^)]+)\)",
     re.MULTILINE,
 )
+
+
+def extract_sources_from_messages(messages: list) -> list[dict]:
+    """
+    从消息序列中提取本次回答实际参考到的来源
+
+    只认工具消息（ToolMessage）：模型自己写在回答里的 [1] 属于幻觉，
+    若一并采信，溯源会指向不存在的资料。
+
+    多次检索可能命中同一条，按 source_id 去重并保留首次出现的顺序。
+
+    :param messages: LangGraph 完整消息序列
+    :return: 去重后的结构化来源列表
+    """
+    sources: list[dict] = []
+    seen: set[str] = set()
+
+    for message in messages or []:
+        if not isinstance(message, ToolMessage):
+            continue
+        for item in parse_sources_from_text(message.content):
+            source_id = item["source_id"]
+            if source_id in seen:
+                continue
+            seen.add(source_id)
+            sources.append(item)
+
+    return sources
+
+
+def build_sources_event(messages: list, session_id: str) -> dict | None:
+    """
+    构造 sources 的 SSE 事件
+
+    无来源时返回 None（前端不必渲染空卡片）。
+
+    :param messages: LangGraph 完整消息序列
+    :param session_id: 会话 ID
+    :return: SSE 事件字典；无来源返回 None
+    """
+    sources = extract_sources_from_messages(messages)
+    if not sources:
+        return None
+
+    return {
+        "type": "sources",
+        "items": sources,
+        "session_id": session_id,
+    }
+
+
+def has_created_note(messages: list) -> bool:
+    """
+    判断本轮对话是否已经创建过笔记
+
+    用于避免重复弹出「存为笔记」建议——已经沉淀过的内容不该再问一次。
+
+    :param messages: LangGraph 完整消息序列
+    :return: 是否调用过 create_note_tool
+    """
+    for message in messages or []:
+        tool_calls = getattr(message, "tool_calls", None)
+        if not tool_calls:
+            continue
+        for call in tool_calls:
+            if call.get("name") == "create_note_tool":
+                return True
+    return False
+
+
+def build_suggestion_event(
+        query: str,
+        response_text: str,
+        note_created: bool,
+        session_id: str,
+) -> dict | None:
+    """
+    构造「把这次对话存成笔记」的建议事件
+
+    克制触发，避免变成骚扰：
+    - 本轮已经创建过笔记 → 不再建议（已经沉淀过了）
+    - 回答过短（寒暄、一两句问答）→ 不值得沉淀
+
+    :param query: 用户本轮提问，用作建议标题
+    :param response_text: 助手回答，用于判断是否值得沉淀
+    :param note_created: 本轮是否已经创建过笔记
+    :param session_id: 会话 ID
+    :return: SSE 事件字典；不该建议时返回 None
+    """
+    if note_created:
+        return None
+    if len(response_text or "") < SUGGESTION_MIN_RESPONSE_LENGTH:
+        return None
+
+    title = (query or "新的对话")[:SUGGESTION_TITLE_MAX_LENGTH]
+    return {
+        "type": "suggestion",
+        "action": "create_note",
+        "title": title,
+        "content_preview": response_text[:SUGGESTION_PREVIEW_MAX_LENGTH],
+        "session_id": session_id,
+    }
 
 
 def parse_source_id(source_id: str) -> tuple[str, str] | None:

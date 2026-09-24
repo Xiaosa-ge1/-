@@ -17,12 +17,65 @@
 | **P0.5** 中间件迁移 LangGraph | ✅ 完成 | `create_agent` 替代 `AgentExecutor`，中间件生效（死代码→7 个生效） |
 | **P2 收尾** 删除前置强制注入 | ✅ 完成 | 检索下沉为 Agent 工具，路由层只转发 |
 | **P3+** `get_document_detail` | ✅ 完成 | 两级检索第二级 |
-| **P4** 溯源链路打通 | ⏳ 未做 | SSE 事件 + 持久化 + 前端 |
-| **P5** 沉淀闭环 | ⏳ 未做 | suggestion 事件 |
+| **P4** 溯源链路打通 | ✅ 完成 | sources 事件 + 持久化 + 前端来源卡片 + 历史回放 |
+| **P5** 沉淀闭环 | ✅ 完成 | suggestion 事件 + 一键存为笔记 |
 | **P6** 评测 | ⏳ 未做 | 评测脚本按用户要求**不重建**；语料生成见 `eval-corpus-generation.md` |
+| **收尾** 前端构建修复 | ✅ 完成 | `NoteList.tsx` 4 处既有类型错误（阻断 `npm run build`） |
 
-测试：`54 passed`（原 7 + 新增 47）。每个阶段均先红后绿。
-代码风格：改动文件 `ruff check` 全绿（既有文件的 6 处问题未动，避免扩大范围）。
+测试：`72 passed`。每个阶段均先红后绿。
+构建：`npm run build` 通过（1.93s）；`tsc -b` 零错误。
+
+### 收尾　前端构建修复（✅ 已完成）
+
+`NoteList.tsx` 有 4 处**既有**类型错误，导致 `npm run build` 失败（与 Agent 化改造无关）：
+
+- 第 55 行 `allValues` 声明后未使用 → 删除
+- 第 82 行 `useRef<ReturnType<typeof setTimeout>>()` 缺少初始值（React 19 起类型要求必填）
+  → 改为 `useRef<ReturnType<typeof setTimeout> | undefined>(undefined)`
+- 第 197 / 207 行向该 ref 赋 `undefined`，随上面类型放宽而消解
+
+### P5　沉淀闭环（✅ 已完成）
+
+对话结束前推送 `{"type":"suggestion","action":"create_note","title":...,"content_preview":...}`，
+前端渲染「存为笔记」卡片，点击调 `notesApi.create` 落库。
+
+**克制的触发条件（避免变成骚扰）**：
+
+| 条件 | 行为 |
+|---|---|
+| 本轮已调用过 `create_note_tool` | 不提示（已经沉淀过了） |
+| 回答长度 < 120 字（寒暄、短问答） | 不提示 |
+| 其余 | 提示 |
+
+**新增测试**：`test_knowledge_search.py` +6（含 `has_created_note` 检测）、`test_agent_stream.py` +2。
+代码风格：改动文件 `ruff check` 全绿；前端 `tsc -b` 改动文件零错误。
+
+### P4　溯源链路打通（✅ 已完成）
+
+**四段链路全部打通**
+
+| 段 | 实现 |
+|---|---|
+| 1. 工具层 | 返回文本内嵌 `source_id` |
+| 2. 提取层 | `extract_sources_from_messages()` —— **只认 ToolMessage**，模型自己编的 `[1]` 不算来源；按 source_id 去重 |
+| 3. 传输层 | `build_sources_event()` → SSE `{"type":"sources","items":[...]}`，在 done 之前推送 |
+| 4. 持久化 | 存入 `ChatMessage.metadata_` 的 `sources` 键 —— **复用已有 JSON 字段，无需改表/migration** |
+| 5. 渲染层 | 前端 `useSSE` 新增 `onSources`；AIChat 在回答下方渲染来源卡片（笔记/知识库图标区分） |
+| 6. 历史回放 | `SessionResponse` 新增 `assistant_sources`，与 history 中助手回复一一对应，刷新页面来源不丢 |
+
+**关键设计：只认工具消息**
+
+模型自己写在回答里的 `[1] 笔记《我编的》 (source_id: note:fake)` 必须排除，
+否则溯源会指向不存在的资料。已有测试锁死这条。
+
+**流式改造**：`stream_mode="messages"` 拿不到完整消息序列，改为
+`stream_mode=["messages", "values"]` —— messages 逐 token 推送，values 提供累积状态用于提取来源。
+
+**已知局限**：多次检索时，每次工具返回的编号都从 1 开始，因此回答里的 `[1]`
+无法精确映射到某一次检索。当前做法是展示去重后的来源列表（参考资料），不做逐条精确跳转。
+若要精确跳转，需让工具层维护会话级计数（受 ContextVar 限制，需改用消息内计数）。
+
+**新增测试**：`test_knowledge_search.py` +6、`test_agent_stream.py` +4。
 
 ---
 

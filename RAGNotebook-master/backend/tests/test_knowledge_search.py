@@ -1,5 +1,11 @@
+from langchain_core.messages import AIMessage, ToolMessage
+
 from app.rag.knowledge_search import (
+    build_sources_event,
+    build_suggestion_event,
+    extract_sources_from_messages,
     format_for_model,
+    has_created_note,
     parse_source_id,
     parse_sources_from_text,
 )
@@ -89,3 +95,95 @@ def test_parse_source_id_rejects_invalid():
     assert parse_source_id("") is None
     assert parse_source_id("nocolon") is None
     assert parse_source_id("unknown:x") is None
+
+
+def _tool_message(content: str, call_id: str = "c1") -> ToolMessage:
+    return ToolMessage(content=content, tool_call_id=call_id)
+
+
+def test_extract_sources_from_tool_messages():
+    """来源必须从工具消息里提取，这是溯源链路的数据源"""
+    messages = [
+        _tool_message("[1] 笔记《MySQL 索引》 (source_id: note:n1)\n索引失效"),
+        _tool_message("[1] 知识库《redis.pdf》 (source_id: kb:c1)\n缓存淘汰", call_id="c2"),
+    ]
+    sources = extract_sources_from_messages(messages)
+    assert [item["source_id"] for item in sources] == ["note:n1", "kb:c1"]
+
+
+def test_extract_sources_dedupes():
+    """多次检索可能命中同一条资料，来源列表必须去重"""
+    same = "[1] 笔记《MySQL 索引》 (source_id: note:n1)\n索引失效"
+    sources = extract_sources_from_messages([
+        _tool_message(same, "c1"),
+        _tool_message(same, "c2"),
+    ])
+    assert len(sources) == 1
+
+
+def test_extract_sources_ignores_model_written_text():
+    """模型自己编的 [1] 不能被当成来源，否则溯源会指向不存在的东西"""
+    messages = [AIMessage(content="[1] 笔记《我编的》 (source_id: note:fake)")]
+    assert extract_sources_from_messages(messages) == []
+
+
+def test_extract_sources_handles_empty_messages():
+    assert extract_sources_from_messages([]) == []
+
+
+def test_build_sources_event_returns_none_without_sources():
+    """没有来源时不应发 sources 事件，避免前端渲染空卡片"""
+    assert build_sources_event([AIMessage(content="普通回答")], "s1") is None
+
+
+def test_build_sources_event_carries_items_and_session():
+    """sources 事件必须带会话 ID 与结构化条目，前端据此渲染来源卡片"""
+    messages = [_tool_message("[1] 笔记《MySQL 索引》 (source_id: note:n1)\n索引失效")]
+    event = build_sources_event(messages, "s1")
+    assert event["type"] == "sources"
+    assert event["session_id"] == "s1"
+    assert event["items"][0]["source_id"] == "note:n1"
+    assert event["items"][0]["title"] == "MySQL 索引"
+
+
+def test_suggestion_offered_for_substantive_answer():
+    """有实质内容的回答才建议沉淀，让对话能变成知识"""
+    event = build_suggestion_event("怎么设计索引", "内容" * 100, False, "s1")
+    assert event["type"] == "suggestion"
+    assert event["action"] == "create_note"
+    assert event["title"] == "怎么设计索引"
+
+
+def test_suggestion_skipped_when_note_already_created():
+    """本轮已经存过笔记就别再建议，重复打扰比不提示更糟"""
+    assert build_suggestion_event("问题", "内容" * 100, True, "s1") is None
+
+
+def test_suggestion_skipped_for_short_answer():
+    """寒暄、短问答不该弹「存为笔记」，否则处处是骚扰"""
+    assert build_suggestion_event("你好", "你好呀", False, "s1") is None
+
+
+def test_suggestion_truncates_long_title():
+    """标题过长要截断，前端卡片放不下"""
+    event = build_suggestion_event("问" * 80, "内容" * 100, False, "s1")
+    assert len(event["title"]) <= 40
+
+
+def _ai_message_with_tool_call(name: str):
+    from langchain_core.messages import AIMessage
+
+    message = AIMessage(content="")
+    message.tool_calls = [{"name": name, "args": {}, "id": "c1"}]
+    return message
+
+
+def test_detects_note_creation():
+    """本轮创建过笔记就应识别出来，避免重复建议沉淀"""
+    assert has_created_note([_ai_message_with_tool_call("create_note_tool")]) is True
+
+
+def test_no_note_creation_for_other_tools():
+    """调用别的工具不该被当成已沉淀"""
+    assert has_created_note([_ai_message_with_tool_call("search_knowledge_tool")]) is False
+    assert has_created_note([]) is False

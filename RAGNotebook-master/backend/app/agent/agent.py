@@ -22,6 +22,7 @@ from app.agent.agent_tools import (
     what_time_is_now,
 )
 from app.core.logger_handler import logger
+from app.rag.knowledge_search import build_sources_event, build_suggestion_event, has_created_note
 from app.services import session_manager as sm
 from app.utils.prompt_loader import load_prompt
 
@@ -331,7 +332,7 @@ async def get_agent_stream_response(
     """
 
     thinking_queue = asyncio.Queue()
-    agent_result_holder = {"response": None, "error": None}
+    agent_result_holder = {"response": None, "error": None, "messages": []}
     agent_done = asyncio.Event()
 
     async def run_agent():
@@ -347,24 +348,31 @@ async def get_agent_stream_response(
             agent = agent_factory.create_agent(custom_tools=custom_tools, **kwargs)
 
             full_response = []
+            final_messages: list = []
 
-            async for message_chunk, metadata in agent.astream(
-                {"messages": messages}, stream_mode="messages"
+            # 组合模式：messages 逐 token 推送，values 提供完整消息序列（据此提取来源）
+            async for mode, payload in agent.astream(
+                {"messages": messages}, stream_mode=["messages", "values"]
             ):
-                # 只取「模型节点」产出的文本；工具节点的内容是调用参数，不能当回答
-                if metadata.get("langgraph_node") != "model":
-                    continue
-                # 带工具调用的分片属于中间步骤，跳过
-                if getattr(message_chunk, "tool_call_chunks", None):
-                    continue
-                content = getattr(message_chunk, "content", "")
-                if not content or not isinstance(content, str):
-                    continue
-                full_response.append(content)
-                await thinking_queue.put(
-                    {"type": "response", "content": content, "session_id": session_id}
-                )
+                if mode == "messages":
+                    message_chunk, metadata = payload
+                    # 只取「模型节点」产出的文本；工具节点的内容是调用参数，不能当回答
+                    if metadata.get("langgraph_node") != "model":
+                        continue
+                    # 带工具调用的分片属于中间步骤，跳过
+                    if getattr(message_chunk, "tool_call_chunks", None):
+                        continue
+                    content = getattr(message_chunk, "content", "")
+                    if not content or not isinstance(content, str):
+                        continue
+                    full_response.append(content)
+                    await thinking_queue.put(
+                        {"type": "response", "content": content, "session_id": session_id}
+                    )
+                elif mode == "values" and isinstance(payload, dict):
+                    final_messages = payload.get("messages", []) or []
 
+            agent_result_holder["messages"] = final_messages
             agent_result_holder["response"] = "".join(full_response) if full_response else "抱歉，我无法理解您的请求。"
         except Exception as e:
             logger.error(f"【Agent流式响应】Agent执行失败: {e}", exc_info=True)
@@ -412,8 +420,30 @@ async def get_agent_stream_response(
 
         response = agent_result_holder["response"]
 
-        # 添加到会话历史
-        await sm.session_manager.add_message(session_id, user_id, query, response)
+        # 来源卡片：在 done 之前推送，前端据此渲染可点开的来源
+        sources_event = build_sources_event(agent_result_holder["messages"], session_id)
+        if sources_event:
+            yield f"data: {json.dumps(sources_event, ensure_ascii=False)}\n\n"
+            logger.info(f"【Agent流式响应】推送 {len(sources_event['items'])} 条来源")
+
+        # 沉淀建议：回答有实质内容、且本轮没存过笔记时，提示可存成笔记
+        suggestion_event = build_suggestion_event(
+            query,
+            response,
+            has_created_note(agent_result_holder["messages"]),
+            session_id,
+        )
+        if suggestion_event:
+            yield f"data: {json.dumps(suggestion_event, ensure_ascii=False)}\n\n"
+
+        # 添加到会话历史（连同来源一起持久化，刷新页面后不丢）
+        await sm.session_manager.add_message(
+            session_id,
+            user_id,
+            query,
+            response,
+            sources=sources_event["items"] if sources_event else None,
+        )
         logger.info("【Agent流式响应】添加到会话历史成功")
 
         # 正文已在生成过程中实时推送，这里只发结束标记

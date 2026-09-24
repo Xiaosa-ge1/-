@@ -1,19 +1,24 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
-import { Send, Sparkles, Bot, User, ChevronDown, ChevronRight, Loader2 } from 'lucide-react'
+import { Send, Sparkles, Bot, User, ChevronDown, ChevronRight, Loader2, FileText, BookOpen } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import rehypeHighlight from 'rehype-highlight'
 import rehypeRaw from 'rehype-raw'
 import { useSSE } from '../hooks/useSSE'
 import { sessionsApi } from '../api/sessions'
+import { notesApi } from '../api/notes'
 import { useThemeStore } from '../stores/useThemeStore'
+import type { SourceItem, SuggestionData } from '../types/api'
 
 interface Message {
   role: 'user' | 'assistant'
   content: string
   thinking?: string
   steps?: string[]
+  sources?: SourceItem[]
+  suggestion?: SuggestionData
+  savedAt?: number
 }
 
 const quickQuestions = [
@@ -64,12 +69,24 @@ export default function AIChat() {
     if (sessionId) {
       setLoadingHistory(true)
       sessionsApi.get(sessionId).then((res) => {
-        const data = res.data as { history?: [string, string][] } | undefined
+        const data = res.data as {
+          history?: [string, string][]
+          assistant_sources?: (SourceItem[] | null)[]
+        } | undefined
         if (data?.history) {
-          setMessages(data.history.flatMap(([query, response]) => [
-            { role: 'user', content: query },
-            { role: 'assistant', content: response },
-          ]))
+          const sources = data.assistant_sources || []
+          let assistantIndex = -1
+          setMessages(data.history.flatMap(([query, response]) => {
+            assistantIndex += 1
+            return [
+              { role: 'user' as const, content: query },
+              {
+                role: 'assistant' as const,
+                content: response,
+                sources: sources[assistantIndex] || undefined,
+              },
+            ]
+          }))
         }
       }).catch(() => {}).finally(() => setLoadingHistory(false))
     }
@@ -127,6 +144,32 @@ export default function AIChat() {
             })
           }
         },
+        onSources: (items) => {
+          // sources 事件在正文之后到达，挂到最后一条助手消息上
+          setMessages((prev) => {
+            const next = [...prev]
+            for (let k = next.length - 1; k >= 0; k--) {
+              if (next[k].role === 'assistant') {
+                next[k] = { ...next[k], sources: items }
+                break
+              }
+            }
+            return next
+          })
+        },
+        onSuggestion: (data) => {
+          // suggestion 事件在正文之后到达，挂到最后一条助手消息上
+          setMessages((prev) => {
+            const next = [...prev]
+            for (let k = next.length - 1; k >= 0; k--) {
+              if (next[k].role === 'assistant') {
+                next[k] = { ...next[k], suggestion: data }
+                break
+              }
+            }
+            return next
+          })
+        },
         onDone: (newSessionId) => {
           if (rafRef.current !== null) {
             cancelAnimationFrame(rafRef.current)
@@ -146,6 +189,25 @@ export default function AIChat() {
       }
     )
   }, [loading, sessionId, start, navigate, flushContent])
+
+  // 把某条助手回答沉淀成笔记；失败静默，不能因为存不了就打断对话
+  const handleSaveNote = useCallback(async (index: number) => {
+    const msg = messages[index]
+    if (!msg?.suggestion) return
+    try {
+      await notesApi.create({
+        title: msg.suggestion.title,
+        content: msg.content,
+      })
+      setMessages((prev) => {
+        const next = [...prev]
+        next[index] = { ...next[index], savedAt: Date.now() }
+        return next
+      })
+    } catch {
+      // 静默失败
+    }
+  }, [messages])
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -242,6 +304,44 @@ export default function AIChat() {
                         {msg.content}
                       </ReactMarkdown>
                     </div>
+                    {msg.sources && msg.sources.length > 0 && (
+                      <div className="mt-3 pt-3 border-t border-[var(--color-border)]">
+                        <div className="flex items-center gap-1.5 mb-2 text-xs text-[var(--color-text-tertiary)]">
+                          <BookOpen size={12} />
+                          {t('chat.sources')}
+                        </div>
+                        <div className="flex flex-wrap gap-2">
+                          {msg.sources.map((src) => (
+                            <div
+                              key={src.source_id}
+                              title={src.title}
+                              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-[var(--color-card)] border border-[var(--color-border)] text-xs text-[var(--color-text-secondary)] max-w-[240px]"
+                            >
+                              {src.source_type === 'note' ? <FileText size={12} className="shrink-0" /> : <BookOpen size={12} className="shrink-0" />}
+                              <span className="truncate">{src.title}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    {msg.suggestion && (
+                      <div className="mt-3 flex items-center gap-3 px-3 py-2.5 rounded-lg bg-[var(--color-card)] border border-[var(--color-border)]">
+                        <span className="text-xs text-[var(--color-text-secondary)] flex-1">
+                          {t('chat.saveAsNote')}
+                        </span>
+                        {msg.savedAt ? (
+                          <span className="text-xs text-[var(--color-accent)]">{t('chat.savedToNotes')}</span>
+                        ) : (
+                          <button
+                            onClick={() => handleSaveNote(i)}
+                            className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-[var(--color-accent)] text-white text-xs hover:opacity-90"
+                          >
+                            <FileText size={12} />
+                            {t('chat.saveToNotes')}
+                          </button>
+                        )}
+                      </div>
+                    )}
                     {hasStreamingAssistant && i === messages.length - 1 && (
                       <div className="flex gap-1 mt-3">
                         <span className="w-2 h-2 rounded-full bg-[var(--color-accent)] animate-bounce" style={{ animationDelay: '0ms' }} />

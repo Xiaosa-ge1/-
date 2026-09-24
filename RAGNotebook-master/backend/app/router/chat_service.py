@@ -33,10 +33,9 @@ class ChatService:
         response = await rag_service.rag_summary(query)
         return response
 
-    async def handle_get_session(self, session_id: str, user_id: str) -> list[tuple[str, str]]:
-        """处理获取会话逻辑"""
-        history = await sm.session_manager.get_history(session_id, user_id)
-        return history
+    async def handle_get_session(self, session_id: str, user_id: str) -> dict:
+        """处理获取会话逻辑（含助手回复引用的来源）"""
+        return await sm.session_manager.get_session(session_id, user_id)
 
     async def handle_delete_session(self, session_id: str, user_id: str) -> None:
         """处理删除会话逻辑"""
